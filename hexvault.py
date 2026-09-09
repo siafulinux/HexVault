@@ -7,14 +7,14 @@ HexVault | Digital File Recovery
 Lightweight Tkinter frontend for PhotoRec on Linux.
 
 Design goals:
-- Deleted-file recovery only: PhotoRec FREE SPACE mode is hard-coded.
-- One authorization prompt per recovery job.
-- Mounted and unmounted source partitions are supported.
-- Mounted source partitions are unmounted by the single privileged helper.
-- Tabbed layout for organized configuration and monitoring.
-- Process pause / resume support (SIGSTOP / SIGCONT via privileged helper).
-- Clean, informative status logs explaining file carving & staging pipelines.
-- Standalone execution with zero third-party Python dependencies.
+- Deleted-file recovery only: PhotoRec FREE SPACE mode is hard-coded[cite: 1].
+- One authorization prompt per recovery job[cite: 1].
+- Mounted and unmounted source partitions are supported[cite: 1].
+- Mounted source partitions are unmounted by the single privileged helper[cite: 1].
+- Tabbed layout for organized configuration and monitoring[cite: 1].
+- Process pause / resume support (SIGSTOP / SIGCONT via privileged helper)[cite: 1].
+- Clean, informative status logs explaining file carving & staging pipelines[cite: 1].
+- Standalone execution with zero third-party Python dependencies[cite: 1].
 """
 
 import json
@@ -73,7 +73,7 @@ class CustomCheckbutton(tk.Canvas):
 
         self.bind("<Button-1>", self._toggle)
 
-        # Trace variable changes to re-draw when updated programmatically
+        # Trace variable changes to re-draw when updated programmatically[cite: 1]
         self.var_trace = self.variable.trace_add("write", lambda *args: self.redraw())
         self.redraw()
 
@@ -1082,6 +1082,19 @@ def iter_new_files(raw_dir, before_files):
     return result
 
 
+def restore_workspace_ownership(runtime_dir, uid, gid):
+    try:
+        subprocess.run(
+            ["chown", "-R", f"{uid}:{gid}", runtime_dir],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=120,
+        )
+    except Exception:
+        pass
+
+
 def main():
     if os.geteuid() != 0:
         emit("ERROR helper_not_root\n")
@@ -1336,6 +1349,8 @@ def main():
         except Exception as exc:
             ownership_failures.append({"category": category, "error": str(exc)})
 
+    restore_workspace_ownership(runtime_dir, uid, gid)
+
     overall_status = (
         "stopped" if stopped
         else "failed" if scan_code != 0
@@ -1485,6 +1500,14 @@ class PhotoRecGUI(tk.Tk):
 
         self.destination_var = tk.StringVar(value=DEFAULT_RECOVERY_DIR)
         self.destination_preview_var = tk.StringVar()
+        self.appearance_var = tk.StringVar(value="System")
+
+        # Load saved user settings
+        saved = self.load_user_settings()
+        if "appearance" in saved:
+            self.appearance_var.set(saved["appearance"])
+        if "destination" in saved and os.path.isdir(saved["destination"]):
+            self.destination_var.set(saved["destination"])
 
         self.running = False
         self.paused = False
@@ -1497,7 +1520,6 @@ class PhotoRecGUI(tk.Tk):
         self.pause_file = None
         self.log_dir = None
 
-        self.appearance_var = tk.StringVar(value="System")
         self.current_theme_name = None
 
         self.configure_styles()
@@ -1508,8 +1530,49 @@ class PhotoRecGUI(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
 
-        # Defer shell queries to allow Tkinter main loop to draw immediately
+        # Defer shell queries to allow Tkinter main loop to draw immediately[cite: 1]
         self.after(50, self.initial_load)
+
+    def get_settings_path(self):
+        config_dir = os.path.expanduser("~/.config/hexvault")
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.join(config_dir, "settings.json")
+
+    def load_user_settings(self):
+        settings_path = self.get_settings_path()
+        if not os.path.exists(settings_path):
+            return {}
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_user_settings(self):
+        filters_saved = {
+            cat: var.get() for cat, var in self.filter_vars.items()
+        }
+        settings = {
+            "appearance": self.appearance_var.get(),
+            "destination": self.destination_var.get(),
+            "selected_extensions": self.selected_extensions(),
+            "filters": filters_saved,
+        }
+        try:
+            with open(self.get_settings_path(), "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+        except Exception:
+            pass
+
+    def reset_to_defaults(self):
+        for ext, var in self.type_vars.items():
+            var.set(ext in DEFAULT_SELECTED)
+        for cat, var in self.filter_vars.items():
+            if cat in DEFAULT_MIN_SIZE:
+                var.set(DEFAULT_MIN_SIZE[cat])
+        for cat, var in self.dimension_vars.items():
+            var.set(DEFAULT_MIN_DIMENSIONS)
+        self.update_destination_preview()
 
     def bind_keyboard_shortcuts(self):
         self.bind_all("<Control-q>", lambda e: self.exit_app())
@@ -1550,7 +1613,7 @@ class PhotoRecGUI(tk.Tk):
 
             self.main_canvas.configure(scrollregion=(0, 0, event.width if event else self.main_canvas.winfo_width(), content_height))
 
-            # Dynamic outer scrollbar display logic
+            # Dynamic outer scrollbar display logic[cite: 1]
             if content_height > canvas_height and canvas_height > 100:
                 if not self.main_scrollbar.winfo_ismapped():
                     self.main_scrollbar.pack(side="right", fill="y")
@@ -1572,7 +1635,7 @@ class PhotoRecGUI(tk.Tk):
             widget.bind("<Button-4>", _on_main_mousewheel, add="+")
             widget.bind("<Button-5>", _on_main_mousewheel, add="+")
             for child in widget.winfo_children():
-                # Skip widgets that have their own scroll handling (e.g. inner canvas on Tab 2)
+                # Skip widgets that have their own scroll handling (e.g. inner canvas on Tab 2)[cite: 1]
                 if getattr(child, "types_canvas", None) is None:
                     _bind_mousewheel(child)
 
@@ -1695,7 +1758,7 @@ class PhotoRecGUI(tk.Tk):
             except Exception as e:
                 print(f"Could not load header banner: {e}")
 
-        # Header controls container
+        # Header controls container[cite: 1]
         header = ttk.Frame(self.main_container, padding=(12, 2, 12, 2))
         header.pack(fill="x")
 
@@ -1721,7 +1784,7 @@ class PhotoRecGUI(tk.Tk):
 
         ttk.Button(app_frame, text="Exit", command=self.exit_app).pack(side="right")
 
-        # Tabbed Notebook positioned underneath header
+        # Tabbed Notebook positioned underneath header[cite: 1]
         self.notebook = ttk.Notebook(self.main_container)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(2, 10))
 
@@ -1788,7 +1851,11 @@ class PhotoRecGUI(tk.Tk):
         ttk.Button(nav_row, text="Next →", style="Big.TButton", command=lambda: self.notebook.select(self.tab_types)).pack(side="right")
 
     def build_types_tab(self):
-        ttk.Label(self.tab_types, text="3. File Types & Post-Carving Filters", style="H2.TLabel").pack(anchor="w", pady=(0, 6))
+        header_row = ttk.Frame(self.tab_types)
+        header_row.pack(fill="x", pady=(0, 6))
+
+        ttk.Label(header_row, text="3. File Types & Post-Carving Filters", style="H2.TLabel").pack(side="left")
+        ttk.Button(header_row, text="Reset to Defaults", command=self.reset_to_defaults).pack(side="right")
 
         scroll_wrapper = ttk.Frame(self.tab_types)
         scroll_wrapper.pack(fill="both", expand=True)
@@ -1875,7 +1942,7 @@ class PhotoRecGUI(tk.Tk):
         out_scroll.pack(side="right", fill="y")
         self.output.configure(yscrollcommand=out_scroll.set)
 
-        # Bottom navigation and execution control panel
+        # Bottom navigation and execution control panel[cite: 1]
         nav_row = ttk.Frame(self.tab_status)
         nav_row.pack(fill="x", side="bottom", pady=(10, 0))
 
@@ -1927,6 +1994,9 @@ class PhotoRecGUI(tk.Tk):
         self.dimension_vars.clear()
 
         colors = DARK_THEME if self.effective_theme(self.appearance_var.get()) == "dark" else LIGHT_THEME
+        saved = self.load_user_settings()
+        saved_exts = set(saved.get("selected_extensions", DEFAULT_SELECTED))
+        saved_filters = saved.get("filters", {})
 
         for category, mapping in FILE_TYPES.items():
             category_frame = ttk.Frame(self.type_container, padding=(0, 4, 0, 6))
@@ -1944,7 +2014,7 @@ class PhotoRecGUI(tk.Tk):
 
             extensions = list(mapping.keys())
             for index, extension in enumerate(extensions):
-                var = tk.BooleanVar(value=(extension in DEFAULT_SELECTED))
+                var = tk.BooleanVar(value=(extension in saved_exts))
                 self.type_vars[extension] = var
 
                 cb = CustomCheckbutton(
@@ -1966,7 +2036,8 @@ class PhotoRecGUI(tk.Tk):
             filter_row.pack(fill="x", pady=(4, 0))
 
             ttk.Label(filter_row, text="Min Size: ").pack(side="left")
-            size_var = tk.StringVar(value=DEFAULT_MIN_SIZE[category])
+            default_size = saved_filters.get(category, DEFAULT_MIN_SIZE[category])
+            size_var = tk.StringVar(value=default_size)
             self.filter_vars[category] = size_var
             size_combo = ttk.Combobox(filter_row, textvariable=size_var, values=SIZE_CHOICES, state="readonly", width=12)
             size_combo.pack(side="left", padx=(4, 12))
@@ -2214,11 +2285,13 @@ class PhotoRecGUI(tk.Tk):
             return []
         extensions = self.selected_extensions()
         sequence = [f"fileopt,{ext},enable" for ext in extensions]
-        raw_base = os.path.join(HEXVAULT_RUNTIME_DIR, "raw", "recup_dir")
+        preview_dir = self.runtime_dir if self.runtime_dir and os.path.exists(self.runtime_dir) else HEXVAULT_RUNTIME_DIR
+        raw_base = os.path.join(preview_dir, "raw", "recup_dir")
+        log_path = os.path.join(preview_dir, "logs", "photorec_scan.log")
 
         cmd = [
             self.photorec,
-            "/log", "/logname", "/tmp/hexvault/logs/photorec_scan.log",
+            "/log", "/logname", log_path,
             "/d", raw_base,
             "/cmd", source,
             ",".join(sequence),
@@ -2259,16 +2332,15 @@ class PhotoRecGUI(tk.Tk):
     # ------------------------------------------------------------------
 
     def prepare_helper_files(self):
-        if os.path.exists(HEXVAULT_RUNTIME_DIR):
-            try:
-                shutil.rmtree(HEXVAULT_RUNTIME_DIR)
-            except OSError as exc:
-                raise RuntimeError(f"Could not clear workspace: {exc}")
+        os.makedirs(HEXVAULT_RUNTIME_DIR, exist_ok=True)
+        try:
+            self.runtime_dir = tempfile.mkdtemp(prefix="job-", dir=HEXVAULT_RUNTIME_DIR)
+        except OSError as exc:
+            raise RuntimeError(f"Could not create workspace: {exc}")
 
-        os.makedirs(os.path.join(HEXVAULT_RUNTIME_DIR, "logs"), exist_ok=True)
-        os.makedirs(os.path.join(HEXVAULT_RUNTIME_DIR, "raw"), exist_ok=True)
+        os.makedirs(os.path.join(self.runtime_dir, "logs"), exist_ok=True)
+        os.makedirs(os.path.join(self.runtime_dir, "raw"), exist_ok=True)
 
-        self.runtime_dir = HEXVAULT_RUNTIME_DIR
         helper_script = os.path.join(self.runtime_dir, "hexvault_helper.py")
         config_path = os.path.join(self.runtime_dir, "config.json")
         stop_file = os.path.join(self.runtime_dir, "STOP")
@@ -2455,7 +2527,7 @@ class PhotoRecGUI(tk.Tk):
 
         elif token == "SCAN_START":
             self.output_insert_line(f"[SCAN ENGINE] Active file families: {', '.join(payload.get('families', []))}")
-            self.output_insert_line("[SCAN ENGINE] Carving unallocated space. Raw files are temporarily staged in /tmp/hexvault/raw")
+            self.output_insert_line(f"[SCAN ENGINE] Carving unallocated space. Raw files are temporarily staged in {self.runtime_dir or HEXVAULT_RUNTIME_DIR}/raw")
 
         elif token == "SCAN_PAUSED":
             self.status_var.set("Scan process PAUSED.")
@@ -2520,6 +2592,7 @@ class PhotoRecGUI(tk.Tk):
             if not messagebox.askyesno("Exit HexVault", "A recovery operation is in progress. Stop scan and exit?"):
                 return
             self.stop_recovery()
+        self.save_user_settings()
         self.cleanup_runtime_directory()
         self.destroy()
 
