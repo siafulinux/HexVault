@@ -6,15 +6,15 @@ HexVault | Digital File Recovery
 
 Lightweight Tkinter frontend for PhotoRec on Linux.
 
-Design goals:
-- Deleted-file recovery only: PhotoRec FREE SPACE mode is hard-coded[cite: 1].
-- One authorization prompt per recovery job[cite: 1].
-- Mounted and unmounted source partitions are supported[cite: 1].
-- Mounted source partitions are unmounted by the single privileged helper[cite: 1].
-- Tabbed layout for organized configuration and monitoring[cite: 1].
-- Process pause / resume support (SIGSTOP / SIGCONT via privileged helper)[cite: 1].
-- Clean, informative status logs explaining file carving & staging pipelines[cite: 1].
-- Standalone execution with zero third-party Python dependencies[cite: 1].
+Design goals: 
+- Deleted-file recovery only: PhotoRec FREE SPACE mode is hard-coded.
+- One authorization prompt per recovery job.
+- Mounted and unmounted source partitions are supported.
+- Mounted source partitions are unmounted by the single privileged helper.
+- Tabbed layout for organized configuration and monitoring.
+- Process pause / resume support (SIGSTOP / SIGCONT via privileged helper).
+- Clean, informative status logs explaining file carving & staging pipelines.
+- Standalone execution with zero third-party Python dependencies.
 """
 
 import json
@@ -73,7 +73,7 @@ class CustomCheckbutton(tk.Canvas):
 
         self.bind("<Button-1>", self._toggle)
 
-        # Trace variable changes to re-draw when updated programmatically[cite: 1]
+        # Trace variable changes to re-draw when updated programmatically
         self.var_trace = self.variable.trace_add("write", lambda *args: self.redraw())
         self.redraw()
 
@@ -245,6 +245,24 @@ def human_size(value):
         size /= 1024
     return str(value)
 
+def format_time(seconds):
+    try:
+        seconds = int(seconds)
+    except ValueError:
+        return "Calculating..."
+        
+    if seconds < 0 or seconds > 864000:
+        return "Calculating..."
+        
+    mins, secs = divmod(seconds, 60)
+    hours, mins = divmod(mins, 60)
+    
+    if hours > 0:
+        return f"{hours}h {mins}m {secs}s"
+    elif mins > 0:
+        return f"{mins}m {secs}s"
+    else:
+        return f"{secs}s"
 
 def run_command(command, timeout=5):
     try:
@@ -484,6 +502,45 @@ def mountpoints(device):
     if result.returncode != 0:
         return []
     return [x.strip() for x in result.stdout.splitlines() if x.strip()]
+
+
+def get_partition_stats(device):
+    try:
+        result = subprocess.run(
+            ["lsblk", "-b", "-n", "-o", "SIZE,FSTYPE", device],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split()
+            size = int(parts[0])
+            fstype = parts[1] if len(parts) > 1 else ""
+            
+            free_bytes = size
+            df_res = subprocess.run(
+                ["df", "-B1", device],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if df_res.returncode == 0:
+                lines = df_res.stdout.strip().splitlines()
+                if len(lines) >= 2:
+                    fields = lines[1].split()
+                    if len(fields) >= 4:
+                        try:
+                            free_bytes = int(fields[3])
+                        except ValueError:
+                            pass
+            return size, free_bytes, fstype
+    except Exception:
+        pass
+    return 0, 0, ""
 
 
 def unmount_device(device):
@@ -802,11 +859,19 @@ def filter_files(category_dir, category, min_size, min_dimensions, before_files)
     return (kept, discarded, reasons)
 
 
-def build_command(photorec, source, photo_destination, log_path, families):
-    sequence = ["fileopt", "everything", "disable"]
+def build_command(photorec, source, photo_destination, log_path, families, fstype):
+    sequence = ["partition_none", "fileopt", "everything", "disable"]
     for family in families:
         sequence.extend([family, "enable"])
-    sequence.extend(["freespace", "search"])
+    
+    sequence.append("search")
+    
+    if fstype and fstype.lower() in ("ext2", "ext3", "ext4"):
+        sequence.append("ext2")
+    else:
+        sequence.append("other")
+        
+    sequence.append("freespace")
 
     return [
         photorec,
@@ -821,7 +886,7 @@ def build_command(photorec, source, photo_destination, log_path, families):
     ]
 
 
-def run_photorec(command, log_path, stop_file, pause_file, raw_dir, source):
+def run_photorec(command, log_path, stop_file, pause_file, raw_dir, source, total_scan_bytes, file_type_multiplier):
     global CURRENT_PHOTOREC, PAUSED
 
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -892,13 +957,36 @@ def run_photorec(command, log_path, stop_file, pause_file, raw_dir, source):
                     except Exception:
                         pass
 
-            if not PAUSED and (now - last_report >= 1.0):
+            if not PAUSED and (now - last_report >= 0.5):
+                elapsed_sec = max(1.0, now - started)
                 current = count_files(raw_dir)
+                
+                scanned_bytes = 0
+                try:
+                    if os.path.exists(log_path):
+                        scanned_bytes = os.path.getsize(log_path) * 250 * file_type_multiplier
+                except Exception:
+                    pass
+                
+                if scanned_bytes <= 0:
+                    scanned_bytes = int(elapsed_sec * 25 * 1024 * 1024)
+
+                if total_scan_bytes > 0:
+                    progress_pct = min(99.0, (float(scanned_bytes) / float(total_scan_bytes)) * 100.0)
+                else:
+                    progress_pct = min(95.0, (elapsed_sec / 120.0) * 100.0)
+
+                bytes_per_sec = float(scanned_bytes) / elapsed_sec if elapsed_sec > 0 else 1.0
+                remaining_bytes = max(0, total_scan_bytes - scanned_bytes)
+                eta_seconds = int(remaining_bytes / bytes_per_sec) if bytes_per_sec > 0 else 0
+
                 emit(
                     "PROGRESS "
                     + json.dumps({
                         "category": "Recovery scan",
-                        "elapsed": int(now - started),
+                        "elapsed": int(elapsed_sec),
+                        "percent": round(progress_pct, 1),
+                        "eta": eta_seconds,
                         "files": current,
                         "new_files": max(0, current - before),
                     })
@@ -1095,6 +1183,70 @@ def restore_workspace_ownership(runtime_dir, uid, gid):
         pass
 
 
+def safe_duplicate_target(category_dir, original_name):
+    stem, suffix = os.path.splitext(original_name)
+    counter = 2
+    while True:
+        candidate = os.path.join(category_dir, f"{stem}_{counter}{suffix}")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+
+def wait_for_duplicate_decision(runtime_dir, source_path, target_path, stop_file):
+    request_file = os.path.join(runtime_dir, "duplicate_request.json")
+    response_file = os.path.join(runtime_dir, "duplicate_response.json")
+
+    try:
+        if os.path.exists(request_file):
+            os.remove(request_file)
+        if os.path.exists(response_file):
+            os.remove(response_file)
+    except OSError:
+        pass
+
+    request = {
+        "source": source_path,
+        "target": target_path,
+        "filename": os.path.basename(target_path),
+        "source_size": os.path.getsize(source_path) if os.path.exists(source_path) else 0,
+        "target_size": os.path.getsize(target_path) if os.path.exists(target_path) else 0,
+    }
+
+    try:
+        temp_request = request_file + ".tmp"
+        with open(temp_request, "w", encoding="utf-8") as handle:
+            json.dump(request, handle)
+        os.replace(temp_request, request_file)
+    except OSError as exc:
+        emit("WARNING " + json.dumps(f"Could not create duplicate decision request: {exc}") + "\n")
+        return "keep_existing"
+
+    emit("DUPLICATE_REQUEST " + json.dumps(request) + "\n")
+
+    try:
+        while not requested_stop(stop_file):
+            if os.path.exists(response_file):
+                try:
+                    with open(response_file, "r", encoding="utf-8") as handle:
+                        response = json.load(handle)
+                    decision = response.get("decision", "keep_existing")
+                    if decision in ("keep_existing", "overwrite", "keep_both"):
+                        return decision
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+            time.sleep(0.2)
+    finally:
+        for path in (request_file, response_file):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+    return "keep_existing"
+
+
 def main():
     if os.geteuid() != 0:
         emit("ERROR helper_not_root\n")
@@ -1112,7 +1264,9 @@ def main():
         return 12
 
     source = cfg["source"]
+    fstype = cfg.get("fstype", "")
     destination = cfg["destination"]
+    duplicate_handling = cfg.get("duplicate_handling", "Keep existing")
     photorec = cfg["photorec"]
     categories = cfg["categories"]
     category_dirs = cfg["category_dirs"]
@@ -1139,6 +1293,10 @@ def main():
 
     original_mounts = mountpoints(source)
     unmounted_by_us = False
+
+    total_size, free_bytes, detected_fstype = get_partition_stats(source)
+    if not fstype:
+        fstype = detected_fstype
 
     if original_mounts:
         ok, _ = unmount_device(source)
@@ -1180,13 +1338,25 @@ def main():
         + "\n"
     )
 
+    type_count = len(selected_extensions)
+    if type_count <= 3:
+        file_type_multiplier = 0.8
+    elif type_count <= 8:
+        file_type_multiplier = 1.0
+    else:
+        file_type_multiplier = 1.35
+
+    total_scan_bytes = free_bytes if free_bytes > 0 else (total_size if total_size > 0 else 1024**3)
+
     scan_code, stopped, elapsed, raw_new_files = run_photorec(
-        build_command(photorec, source, raw_base, log_path, all_families),
+        build_command(photorec, source, raw_base, log_path, all_families, fstype),
         log_path,
         stop_file,
         pause_file,
         raw_dir,
         source,
+        total_scan_bytes,
+        file_type_multiplier,
     )
 
     before_category_files = {}
@@ -1197,11 +1367,31 @@ def main():
 
     moved = {category: 0 for category in categories}
     routing_discarded = 0
+    duplicate_kept_existing = 0
+    duplicate_overwritten = 0
+    duplicate_kept_both = 0
+    duplicate_asked = 0
     inventory_rows = []
 
-    emit("ROUTING_START " + json.dumps({"raw_files": raw_new_files, "destination": destination}) + "\n")
+    raw_files_list = iter_new_files(raw_dir, before_raw)
+    total_raw_files = len(raw_files_list)
 
-    for full in iter_new_files(raw_dir, before_raw):
+    emit("ROUTING_START " + json.dumps({"raw_files": total_raw_files, "destination": destination}) + "\n")
+
+    for index, full in enumerate(raw_files_list, 1):
+        if index == 1 or index % 5 == 0 or index == total_raw_files:
+            pct = 90.0 + (float(index) / float(max(1, total_raw_files))) * 9.0
+            emit(
+                "ROUTING_PROGRESS "
+                + json.dumps({
+                    "current": index,
+                    "total": total_raw_files,
+                    "percent": round(pct, 1),
+                    "filename": os.path.basename(full),
+                })
+                + "\n"
+            )
+
         category, classified_ext = classify_recovered_file(
             full,
             selected_extensions,
@@ -1217,14 +1407,44 @@ def main():
             continue
 
         category_dir = os.path.join(destination, category_dirs[category])
-        target = os.path.join(category_dir, os.path.basename(full))
+        original_name = os.path.basename(full)
+        target = os.path.join(category_dir, original_name)
+        decision = None
 
         if os.path.exists(target):
-            stem, suffix = os.path.splitext(os.path.basename(full))
-            counter = 2
-            while os.path.exists(target):
-                target = os.path.join(category_dir, f"{stem}_{counter}{suffix}")
-                counter += 1
+            decision = {
+                "Keep existing": "keep_existing",
+                "Overwrite existing": "overwrite",
+                "Keep both": "keep_both",
+                "Ask each time": "ask",
+            }.get(duplicate_handling, "keep_both")
+
+            if decision == "ask":
+                duplicate_asked += 1
+                decision = wait_for_duplicate_decision(runtime_dir, full, target, stop_file)
+                if requested_stop(stop_file):
+                    try:
+                        os.remove(full)
+                    except OSError:
+                        pass
+                    routing_discarded += 1
+                    break
+
+            if decision == "keep_existing":
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+                duplicate_kept_existing += 1
+                routing_discarded += 1
+                emit("DUPLICATE_RESOLVED " + json.dumps({"action": "kept_existing", "filename": original_name}) + "\n")
+                continue
+
+            if decision == "overwrite":
+                duplicate_overwritten += 1
+            elif decision == "keep_both":
+                target = safe_duplicate_target(category_dir, original_name)
+                duplicate_kept_both += 1
 
         try:
             file_size = os.path.getsize(full)
@@ -1232,7 +1452,14 @@ def main():
             file_size = 0
 
         try:
-            shutil.move(full, target)
+            if os.path.exists(target) and decision == "overwrite":
+                try:
+                    os.replace(full, target)
+                except OSError:
+                    os.remove(target)
+                    shutil.move(full, target)
+            else:
+                shutil.move(full, target)
             moved[category] += 1
             inventory_rows.append({
                 "category": category,
@@ -1264,6 +1491,9 @@ def main():
         emit("WARNING " + json.dumps(f"Could not write recovery inventory: {exc}") + "\n")
 
     results = []
+    total_kept = 0
+    total_discarded = routing_discarded
+    
     for category in categories:
         category_dir = os.path.join(destination, category_dirs[category])
         category_filter = filters.get(category, {})
@@ -1275,6 +1505,9 @@ def main():
             category_filter.get("min_dimensions", "No minimum"),
             before_category_files[category],
         )
+        
+        total_kept += kept
+        total_discarded += discarded
 
         item = {
             "category": category,
@@ -1365,6 +1598,13 @@ def main():
             "remounted": remounted,
             "raw_new_files": raw_new_files,
             "routing_discarded": routing_discarded,
+            "duplicate_kept_existing": duplicate_kept_existing,
+            "duplicate_overwritten": duplicate_overwritten,
+            "duplicate_kept_both": duplicate_kept_both,
+            "duplicate_asked": duplicate_asked,
+            "duplicate_handling": duplicate_handling,
+            "total_kept": total_kept,
+            "total_discarded": total_discarded,
             "scan_elapsed": elapsed,
             "log_path": log_path,
             "inventory_path": inventory_path,
@@ -1465,10 +1705,25 @@ class PhotoRecGUI(tk.Tk):
         super().__init__()
 
         self.title(APP_TITLE)
-        self.geometry("820x720")
-        self.minsize(740, 600)
 
-        # Set App Window Icon
+        # Size the main window around the Setup and File Types tabs.
+        # The File Types tab gets enough vertical space to show the
+        # categories and their controls on a normal desktop.
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+
+        preferred_w = min(920, max(820, screen_w - 80))
+        preferred_h = min(980, max(820, screen_h - 80))
+
+        self.geometry(f"{preferred_w}x{preferred_h}")
+        self.minsize(800, 760)
+
+        # Center the window on the screen.
+        self.update_idletasks()
+        x = max(0, (screen_w - preferred_w) // 2)
+        y = max(0, (screen_h - preferred_h) // 2)
+        self.geometry(f"{preferred_w}x{preferred_h}+{x}+{y}")
+
         icon_path = get_asset_path("icon.png")
         if icon_path:
             try:
@@ -1501,13 +1756,15 @@ class PhotoRecGUI(tk.Tk):
         self.destination_var = tk.StringVar(value=DEFAULT_RECOVERY_DIR)
         self.destination_preview_var = tk.StringVar()
         self.appearance_var = tk.StringVar(value="System")
+        self.duplicate_handling_var = tk.StringVar(value="Keep existing")
 
-        # Load saved user settings
         saved = self.load_user_settings()
         if "appearance" in saved:
             self.appearance_var.set(saved["appearance"])
         if "destination" in saved and os.path.isdir(saved["destination"]):
             self.destination_var.set(saved["destination"])
+        if saved.get("duplicate_handling") in ("Keep existing", "Overwrite existing", "Keep both", "Ask each time"):
+            self.duplicate_handling_var.set(saved["duplicate_handling"])
 
         self.running = False
         self.paused = False
@@ -1525,12 +1782,11 @@ class PhotoRecGUI(tk.Tk):
         self.configure_styles()
         self.build_scrollable_container()
         self.build_interface()
+        self.update_destination_preview()
         self.apply_theme(self.appearance_var.get())
         self.bind_keyboard_shortcuts()
 
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
-
-        # Defer shell queries to allow Tkinter main loop to draw immediately[cite: 1]
         self.after(50, self.initial_load)
 
     def get_settings_path(self):
@@ -1555,6 +1811,7 @@ class PhotoRecGUI(tk.Tk):
         settings = {
             "appearance": self.appearance_var.get(),
             "destination": self.destination_var.get(),
+            "duplicate_handling": self.duplicate_handling_var.get(),
             "selected_extensions": self.selected_extensions(),
             "filters": filters_saved,
         }
@@ -1613,7 +1870,6 @@ class PhotoRecGUI(tk.Tk):
 
             self.main_canvas.configure(scrollregion=(0, 0, event.width if event else self.main_canvas.winfo_width(), content_height))
 
-            # Dynamic outer scrollbar display logic[cite: 1]
             if content_height > canvas_height and canvas_height > 100:
                 if not self.main_scrollbar.winfo_ismapped():
                     self.main_scrollbar.pack(side="right", fill="y")
@@ -1635,19 +1891,13 @@ class PhotoRecGUI(tk.Tk):
             widget.bind("<Button-4>", _on_main_mousewheel, add="+")
             widget.bind("<Button-5>", _on_main_mousewheel, add="+")
             for child in widget.winfo_children():
-                # Skip widgets that have their own scroll handling (e.g. inner canvas on Tab 2)[cite: 1]
                 if getattr(child, "types_canvas", None) is None:
                     _bind_mousewheel(child)
 
         self._bind_main_mousewheel = _bind_mousewheel
-
         self.main_canvas.bind("<Configure>", _on_main_configure)
         self.main_container.bind("<Configure>", _check_scrollbar_needed)
         self.bind("<Configure>", _check_scrollbar_needed)
-
-    # ------------------------------------------------------------------
-    # Styling & Theme management
-    # ------------------------------------------------------------------
 
     def configure_styles(self):
         self.style = ttk.Style(self)
@@ -1720,10 +1970,6 @@ class PhotoRecGUI(tk.Tk):
         if update_selector and hasattr(self, "appearance_var"):
             self.appearance_var.set(selection)
 
-    # ------------------------------------------------------------------
-    # GUI Layout & Notebook Construction
-    # ------------------------------------------------------------------
-
     def build_interface(self):
         banner_path = get_asset_path("banner.png")
         if banner_path:
@@ -1758,7 +2004,6 @@ class PhotoRecGUI(tk.Tk):
             except Exception as e:
                 print(f"Could not load header banner: {e}")
 
-        # Header controls container[cite: 1]
         header = ttk.Frame(self.main_container, padding=(12, 2, 12, 2))
         header.pack(fill="x")
 
@@ -1784,7 +2029,6 @@ class PhotoRecGUI(tk.Tk):
 
         ttk.Button(app_frame, text="Exit", command=self.exit_app).pack(side="right")
 
-        # Tabbed Notebook positioned underneath header[cite: 1]
         self.notebook = ttk.Notebook(self.main_container)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(2, 10))
 
@@ -1845,6 +2089,35 @@ class PhotoRecGUI(tk.Tk):
 
         self.destination_preview = ttk.Label(self.tab_setup, text="", wraplength=720)
         self.destination_preview.pack(anchor="w")
+
+        duplicate_frame = ttk.LabelFrame(self.tab_setup, text="Duplicate File Handling", padding=8)
+        duplicate_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(
+            duplicate_frame,
+            text="When a recovered file has the same filename as a file already in the destination:"
+        ).pack(anchor="w", pady=(0, 5))
+
+        duplicate_row = ttk.Frame(duplicate_frame)
+        duplicate_row.pack(fill="x")
+        self.duplicate_combo = ttk.Combobox(
+            duplicate_row,
+            textvariable=self.duplicate_handling_var,
+            values=["Keep existing", "Overwrite existing", "Keep both", "Ask each time"],
+            state="readonly",
+            width=22,
+        )
+        self.duplicate_combo.pack(side="left")
+        ttk.Label(
+            duplicate_row,
+            text="  Keep both adds _2, _3, etc. to the recovered filename."
+        ).pack(side="left", padx=(8, 0))
+
+        self.duplicate_help = ttk.Label(
+            duplicate_frame,
+            text="Keep existing is the safest recovery default because it never replaces a file already in the destination."
+        )
+        self.duplicate_help.pack(anchor="w", pady=(5, 0))
 
         nav_row = ttk.Frame(self.tab_setup)
         nav_row.pack(fill="x", side="bottom", pady=(10, 0))
@@ -1917,7 +2190,8 @@ class PhotoRecGUI(tk.Tk):
         self.current_progress_var = tk.StringVar(value="No recovery in progress.")
         ttk.Label(self.tab_status, textvariable=self.current_progress_var, wraplength=720).pack(anchor="w", pady=(2, 4))
 
-        self.progress = ttk.Progressbar(self.tab_status, mode="indeterminate")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress = ttk.Progressbar(self.tab_status, orient="horizontal", length=720, mode="determinate", variable=self.progress_var)
         self.progress.pack(fill="x", pady=(0, 8))
 
         self.status_var = tk.StringVar(value="Ready.")
@@ -1942,7 +2216,6 @@ class PhotoRecGUI(tk.Tk):
         out_scroll.pack(side="right", fill="y")
         self.output.configure(yscrollcommand=out_scroll.set)
 
-        # Bottom navigation and execution control panel[cite: 1]
         nav_row = ttk.Frame(self.tab_status)
         nav_row.pack(fill="x", side="bottom", pady=(10, 0))
 
@@ -1960,10 +2233,6 @@ class PhotoRecGUI(tk.Tk):
         self.preview_button = ttk.Button(nav_row, text="Preview Cmd", style="Big.TButton", command=self.show_command_preview)
         self.preview_button.pack(side="right", padx=(4, 0))
 
-    # ------------------------------------------------------------------
-    # Image Filter Interlock Callbacks
-    # ------------------------------------------------------------------
-
     def _on_image_size_changed(self, event=None):
         if self.updating_filters:
             return
@@ -1979,10 +2248,6 @@ class PhotoRecGUI(tk.Tk):
             self.updating_filters = True
             self.filter_vars["Images"].set("No minimum")
             self.updating_filters = False
-
-    # ------------------------------------------------------------------
-    # Dynamic File Type Controls
-    # ------------------------------------------------------------------
 
     def build_type_controls(self):
         for widget in self.type_container.winfo_children():
@@ -2075,10 +2340,6 @@ class PhotoRecGUI(tk.Tk):
                     families.append(family)
         return families
 
-    # ------------------------------------------------------------------
-    # Drives & Devices
-    # ------------------------------------------------------------------
-
     def refresh_devices(self):
         def _scan():
             try:
@@ -2158,109 +2419,360 @@ class PhotoRecGUI(tk.Tk):
     def selected_partition(self):
         return self.source_partition["path"] if self.source_partition else None
 
-    # ------------------------------------------------------------------
-    # Destination Chooser
-    # ------------------------------------------------------------------
-
     def choose_destination(self):
         colors = DARK_THEME if self.effective_theme(self.appearance_var.get()) == "dark" else LIGHT_THEME
+
+        # Browse Folder opens at the currently selected destination.
+        # The application itself defaults to ~/hexvault when first opened.
+        initial_path = os.path.abspath(
+            os.path.expanduser(self.destination_var.get().strip() or DEFAULT_RECOVERY_DIR)
+        )
+        if not os.path.isdir(initial_path):
+            initial_path = os.path.abspath(os.path.expanduser(DEFAULT_RECOVERY_DIR))
+        try:
+            os.makedirs(initial_path, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(
+                "Recovery directory error",
+                f"Could not create the default recovery directory:\n{exc}",
+                parent=self,
+            )
+            return
+
         dialog = tk.Toplevel(self)
         dialog.title("Choose Recovery Directory")
-        dialog.geometry("680x460")
+        dialog.geometry("820x560")
+        dialog.minsize(700, 460)
         dialog.configure(bg=colors["bg"])
         dialog.transient(self)
         dialog.grab_set()
 
         selected_path = {"value": None}
-        top_frame = ttk.Frame(dialog)
-        top_frame.pack(fill="x", padx=10, pady=8)
+        current_path = {"value": initial_path}
 
-        path_var = tk.StringVar()
+        header = ttk.Frame(dialog)
+        header.pack(fill="x", padx=12, pady=(12, 8))
 
-        def go_up():
-            curr = path_var.get()
-            if curr:
-                parent = os.path.dirname(os.path.abspath(curr))
-                if parent and parent != curr:
-                    populate(parent)
+        ttk.Label(
+            header,
+            text="Choose Recovery Directory",
+            style="H2.TLabel",
+        ).pack(anchor="w")
 
-        def create_folder():
-            curr = path_var.get()
-            if not curr or not os.path.isdir(curr):
-                return
+        ttk.Label(
+            header,
+            text="Choose the folder where recovered files will be saved. "
+                 "Existing files and folders are shown in the current directory.",
+            wraplength=780,
+        ).pack(anchor="w", pady=(3, 8))
 
-            new_name = simpledialog.askstring("New Folder", "Folder Name:", parent=dialog)
-            if new_name:
-                new_name = new_name.strip()
-                if new_name:
-                    target_dir = os.path.join(curr, new_name)
-                    try:
-                        os.makedirs(target_dir, exist_ok=True)
-                        populate(target_dir)
-                    except OSError as exc:
-                        messagebox.showerror("Error", f"Could not create folder:\n{exc}", parent=dialog)
+        location_row = ttk.Frame(header)
+        location_row.pack(fill="x")
 
-        ttk.Button(top_frame, text="▲", width=3, command=go_up).pack(side="left", padx=(0, 4))
-        ttk.Button(top_frame, text="✚ New Folder", command=create_folder).pack(side="left", padx=(0, 8))
+        path_var = tk.StringVar(value=initial_path)
 
-        path_label = ttk.Label(top_frame, textvariable=path_var, font=("TkDefaultFont", 9, "bold"), anchor="w")
-        path_label.pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            location_row,
+            text="↑",
+            width=3,
+            command=lambda: navigate_parent(),
+        ).pack(side="left", padx=(0, 4))
 
-        tree_frame = ttk.Frame(dialog)
-        tree_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        ttk.Button(
+            location_row,
+            text="New Folder",
+            command=lambda: create_folder(),
+        ).pack(side="left", padx=(0, 8))
 
-        tree = ttk.Treeview(tree_frame, columns=("type",), show="tree", style="HexVault.Treeview")
-        tree.pack(side="left", fill="both", expand=True)
+        ttk.Entry(
+            location_row,
+            textvariable=path_var,
+            state="readonly",
+        ).pack(side="left", fill="x", expand=True)
 
-        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        scrollbar.pack(side="right", fill="y")
-        tree.configure(yscrollcommand=scrollbar.set)
+        browser = ttk.Frame(dialog)
+        browser.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-        path_map = {}
+        folder_frame = ttk.LabelFrame(browser, text="Folders", padding=6)
+        folder_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
 
-        def populate(path):
-            p = os.path.abspath(os.path.expanduser(path))
-            if not os.path.isdir(p):
-                return
-            path_var.set(p)
-            for item in tree.get_children():
-                tree.delete(item)
-            path_map.clear()
+        contents_frame = ttk.LabelFrame(browser, text="Contents", padding=6)
+        contents_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
+
+        folder_tree_wrap = ttk.Frame(folder_frame)
+        folder_tree_wrap.pack(fill="both", expand=True)
+
+        folder_tree = ttk.Treeview(
+            folder_tree_wrap,
+            columns=("name", "kind"),
+            show="headings",
+            selectmode="browse",
+            style="HexVault.Treeview",
+        )
+        folder_tree.heading("name", text="Folder")
+        folder_tree.heading("kind", text="Type")
+        folder_tree.column("name", width=245, anchor="w")
+        folder_tree.column("kind", width=70, anchor="center")
+        folder_tree.pack(side="left", fill="both", expand=True)
+
+        folder_scroll = ttk.Scrollbar(
+            folder_tree_wrap,
+            orient="vertical",
+            command=folder_tree.yview,
+        )
+        folder_scroll.pack(side="right", fill="y")
+        folder_tree.configure(yscrollcommand=folder_scroll.set)
+
+        contents_tree_wrap = ttk.Frame(contents_frame)
+        contents_tree_wrap.pack(fill="both", expand=True)
+
+        contents_tree = ttk.Treeview(
+            contents_tree_wrap,
+            columns=("name", "type", "size"),
+            show="headings",
+            selectmode="browse",
+            style="HexVault.Treeview",
+        )
+        contents_tree.heading("name", text="Name")
+        contents_tree.heading("type", text="Type")
+        contents_tree.heading("size", text="Size")
+        contents_tree.column("name", width=255, anchor="w")
+        contents_tree.column("type", width=90, anchor="center")
+        contents_tree.column("size", width=90, anchor="e")
+        contents_tree.pack(side="left", fill="both", expand=True)
+
+        contents_scroll = ttk.Scrollbar(
+            contents_tree_wrap,
+            orient="vertical",
+            command=contents_tree.yview,
+        )
+        contents_scroll.pack(side="right", fill="y")
+        contents_tree.configure(yscrollcommand=contents_scroll.set)
+
+        folder_paths = {}
+        content_paths = {}
+
+        def format_file_size(size):
+            try:
+                size = int(size)
+            except (TypeError, ValueError):
+                return ""
+
+            units = ("B", "KB", "MB", "GB", "TB")
+            value = float(size)
+            for unit in units:
+                if value < 1024 or unit == units[-1]:
+                    if unit == "B":
+                        return f"{int(value)} B"
+                    return f"{value:.1f} {unit}"
+                value /= 1024
+            return ""
+
+        def populate_contents(directory):
+            directory = os.path.abspath(os.path.expanduser(directory))
+
+            for item in contents_tree.get_children():
+                contents_tree.delete(item)
+            content_paths.clear()
 
             try:
-                entries = sorted(os.listdir(p))
+                entries = list(os.scandir(directory))
             except OSError:
                 return
 
-            for name in entries:
-                full = os.path.join(p, name)
-                if os.path.isdir(full) and not name.startswith("."):
-                    item = tree.insert("", "end", text=f"📁 {name}")
-                    path_map[full] = item
+            entries.sort(
+                key=lambda entry: (
+                    not entry.is_dir(follow_symlinks=False),
+                    entry.name.lower(),
+                )
+            )
 
-        def open_selected(e=None):
-            sel = tree.selection()
-            if not sel:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+
+                full_path = os.path.abspath(entry.path)
+
+                if is_dir:
+                    item_id = contents_tree.insert(
+                        "",
+                        "end",
+                        values=(f"📁 {entry.name}", "Folder", ""),
+                    )
+                else:
+                    try:
+                        size = entry.stat().st_size
+                    except OSError:
+                        size = 0
+
+                    suffix = os.path.splitext(entry.name)[1].lower()
+                    file_type = suffix[1:].upper() if suffix else "File"
+
+                    item_id = contents_tree.insert(
+                        "",
+                        "end",
+                        values=(entry.name, file_type, format_file_size(size)),
+                    )
+
+                content_paths[item_id] = full_path
+
+        def populate_folders(directory):
+            directory = os.path.abspath(os.path.expanduser(directory))
+
+            for item in folder_tree.get_children():
+                folder_tree.delete(item)
+            folder_paths.clear()
+
+            parent = os.path.dirname(directory)
+            if parent != directory and os.path.isdir(parent):
+                item_id = folder_tree.insert("", "end", values=("..", "Parent"))
+                folder_paths[item_id] = parent
+
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
                 return
-            item = sel[0]
-            for p, item_id in path_map.items():
-                if item_id == item:
-                    populate(p)
-                    return
 
-        tree.bind("<Double-1>", open_selected)
+            entries.sort(key=lambda entry: entry.name.lower())
 
-        btn_row = ttk.Frame(dialog)
-        btn_row.pack(fill="x", padx=10, pady=10)
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+
+                full_path = os.path.abspath(entry.path)
+                item_id = folder_tree.insert(
+                    "",
+                    "end",
+                    values=(f"📁 {entry.name}", "Folder"),
+                )
+                folder_paths[item_id] = full_path
+
+        def update_selected_label():
+            selected_label_var.set(f"Selected folder: {current_path['value']}")
+
+        def refresh_browser(directory):
+            directory = os.path.abspath(os.path.expanduser(directory))
+            if not os.path.isdir(directory):
+                return
+
+            current_path["value"] = directory
+            path_var.set(directory)
+            populate_folders(directory)
+            populate_contents(directory)
+            update_selected_label()
+
+        def navigate_parent():
+            current = current_path["value"]
+            parent = os.path.dirname(current)
+            if parent and parent != current:
+                refresh_browser(parent)
+
+        def create_folder():
+            current = current_path["value"]
+            if not os.path.isdir(current):
+                return
+
+            new_name = simpledialog.askstring(
+                "New Folder",
+                "Folder name:",
+                parent=dialog,
+            )
+            if not new_name:
+                return
+
+            new_name = new_name.strip()
+            if not new_name or new_name in (".", "..") or "/" in new_name or "\\" in new_name:
+                messagebox.showwarning(
+                    "Invalid folder name",
+                    "Please enter a valid folder name.",
+                    parent=dialog,
+                )
+                return
+
+            target_dir = os.path.join(current, new_name)
+            try:
+                os.makedirs(target_dir, exist_ok=False)
+            except FileExistsError:
+                messagebox.showinfo(
+                    "Folder already exists",
+                    f"The folder '{new_name}' already exists.",
+                    parent=dialog,
+                )
+                refresh_browser(target_dir)
+                return
+            except OSError as exc:
+                messagebox.showerror(
+                    "Could not create folder",
+                    f"Could not create the folder:\n{exc}",
+                    parent=dialog,
+                )
+                return
+
+            refresh_browser(target_dir)
+
+        def folder_double_click(event=None):
+            selection = folder_tree.selection()
+            if not selection:
+                return
+            directory = folder_paths.get(selection[0])
+            if directory:
+                refresh_browser(directory)
+
+        def content_double_click(event=None):
+            selection = contents_tree.selection()
+            if not selection:
+                return
+            path = content_paths.get(selection[0])
+            if path and os.path.isdir(path):
+                refresh_browser(path)
+
+        folder_tree.bind("<Double-1>", folder_double_click)
+        folder_tree.bind("<Return>", folder_double_click)
+        contents_tree.bind("<Double-1>", content_double_click)
+
+        footer = ttk.Frame(dialog)
+        footer.pack(fill="x", padx=12, pady=(0, 12))
+
+        selected_label_var = tk.StringVar(value=f"Selected folder: {initial_path}")
+        ttk.Label(
+            footer,
+            textvariable=selected_label_var,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
 
         def confirm():
-            selected_path["value"] = path_var.get()
+            selected_path["value"] = current_path["value"]
             dialog.destroy()
 
-        ttk.Button(btn_row, text="Select Folder", command=confirm).pack(side="right", padx=(4, 0))
-        ttk.Button(btn_row, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(
+            footer,
+            text="Cancel",
+            command=dialog.destroy,
+        ).pack(side="right", padx=(8, 0))
 
-        populate(self.destination_var.get().strip() or DEFAULT_RECOVERY_DIR)
+        ttk.Button(
+            footer,
+            text="Select This Folder",
+            style="Big.TButton",
+            command=confirm,
+        ).pack(side="right")
+
+        refresh_browser(initial_path)
+
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+
         self.wait_window(dialog)
 
         if selected_path["value"]:
@@ -2275,16 +2787,32 @@ class PhotoRecGUI(tk.Tk):
     def appearance_changed(self, event=None):
         self.apply_theme(self.appearance_var.get())
 
-    # ------------------------------------------------------------------
-    # Command Preview & Validation
-    # ------------------------------------------------------------------
-
     def build_preview_commands(self):
         source = self.selected_partition()
         if not source:
             return []
-        extensions = self.selected_extensions()
-        sequence = [f"fileopt,{ext},enable" for ext in extensions]
+        
+        fstype = self.source_partition.get("fstype", "") if self.source_partition else ""
+        categories = self.selected_categories()
+        families = []
+        for cat in categories:
+            for fam in self.families_for_category(cat):
+                if fam not in families:
+                    families.append(fam)
+        
+        sequence = ["partition_none", "fileopt", "everything", "disable"]
+        for fam in families:
+            sequence.extend([fam, "enable"])
+        
+        sequence.append("search")
+        
+        if fstype and fstype.lower() in ("ext2", "ext3", "ext4"):
+            sequence.append("ext2")
+        else:
+            sequence.append("other")
+            
+        sequence.append("freespace")
+        
         preview_dir = self.runtime_dir if self.runtime_dir and os.path.exists(self.runtime_dir) else HEXVAULT_RUNTIME_DIR
         raw_base = os.path.join(preview_dir, "raw", "recup_dir")
         log_path = os.path.join(preview_dir, "logs", "photorec_scan.log")
@@ -2325,11 +2853,11 @@ class PhotoRecGUI(tk.Tk):
         if not self.selected_extensions():
             messagebox.showwarning("Warning", "Please select at least one file extension.", parent=self)
             return False
+        destination = os.path.abspath(os.path.expanduser(self.destination_var.get().strip() or DEFAULT_RECOVERY_DIR))
+        if not destination:
+            messagebox.showwarning("Warning", "Please select a recovery destination.", parent=self)
+            return False
         return True
-
-    # ------------------------------------------------------------------
-    # Runtime Workspace Setup
-    # ------------------------------------------------------------------
 
     def prepare_helper_files(self):
         os.makedirs(HEXVAULT_RUNTIME_DIR, exist_ok=True)
@@ -2367,7 +2895,9 @@ class PhotoRecGUI(tk.Tk):
         config = {
             "runtime_dir": self.runtime_dir,
             "destination": self.destination_var.get().strip(),
+            "duplicate_handling": self.duplicate_handling_var.get(),
             "source": self.selected_partition(),
+            "fstype": self.source_partition.get("fstype", "") if self.source_partition else "",
             "selected_extensions": self.selected_extensions(),
             "categories": categories,
             "category_dirs": CATEGORY_DIRS,
@@ -2402,15 +2932,12 @@ class PhotoRecGUI(tk.Tk):
                 pass
         self.runtime_dir = None
 
-    # ------------------------------------------------------------------
-    # Execution Worker & Controls
-    # ------------------------------------------------------------------
-
     def start_recovery(self):
         if self.running or not self.validate():
             return
 
         try:
+            self.save_user_settings()
             self.prepare_helper_files()
         except Exception as exc:
             messagebox.showerror("Error", f"Failed to initialize helper workspace:\n{exc}", parent=self)
@@ -2425,7 +2952,7 @@ class PhotoRecGUI(tk.Tk):
 
         self.notebook.select(self.tab_status)
         self.status_var.set("Initializing privileged recovery engine...")
-        self.progress.start(10)
+        self.progress_var.set(0.0)
 
         self.output_clear()
         self.output_insert_line("=== HexVault Recovery Job Started ===")
@@ -2436,35 +2963,41 @@ class PhotoRecGUI(tk.Tk):
         if not self.running or not self.pause_file:
             return
 
-        if not self.paused:
-            try:
-                with open(self.pause_file, "w", encoding="utf-8") as h:
-                    h.write("PAUSE\n")
-                self.paused = True
-                self.pause_button.configure(text="Resume Scan")
-                self.status_var.set("Pause requested...")
-            except OSError:
-                pass
-        else:
-            try:
-                if os.path.exists(self.pause_file):
-                    os.remove(self.pause_file)
-                self.paused = False
-                self.pause_button.configure(text="Pause Scan")
-                self.status_var.set("Resuming scan...")
-            except OSError:
-                pass
+        def _do_pause():
+            if not self.paused:
+                try:
+                    with open(self.pause_file, "w", encoding="utf-8") as h:
+                        h.write("PAUSE\n")
+                    self.paused = True
+                    self.after(0, lambda: self.pause_button.configure(text="Resume Scan"))
+                    self.after(0, lambda: self.status_var.set("Pause requested..."))
+                except OSError:
+                    pass
+            else:
+                try:
+                    if os.path.exists(self.pause_file):
+                        os.remove(self.pause_file)
+                    self.paused = False
+                    self.after(0, lambda: self.pause_button.configure(text="Pause Scan"))
+                    self.after(0, lambda: self.status_var.set("Resuming scan..."))
+                except OSError:
+                    pass
+
+        threading.Thread(target=_do_pause, daemon=True).start()
 
     def stop_recovery(self):
         if not self.running or not self.stop_file:
             return
 
-        self.status_var.set("Stop requested...")
-        try:
-            with open(self.stop_file, "w", encoding="utf-8") as h:
-                h.write("STOP\n")
-        except OSError:
-            pass
+        def _do_stop():
+            self.after(0, lambda: self.status_var.set("Stop requested..."))
+            try:
+                with open(self.stop_file, "w", encoding="utf-8") as h:
+                    h.write("STOP\n")
+            except OSError:
+                pass
+
+        threading.Thread(target=_do_stop, daemon=True).start()
 
     def recovery_worker(self):
         try:
@@ -2487,7 +3020,7 @@ class PhotoRecGUI(tk.Tk):
     def recovery_done(self, code):
         self.running = False
         self.paused = False
-        self.progress.stop()
+        self.progress_var.set(100.0)
 
         self.recover_button.configure(state="normal")
         self.pause_button.configure(state="disabled", text="Pause Scan")
@@ -2503,10 +3036,6 @@ class PhotoRecGUI(tk.Tk):
             self.output_insert_line(f"\n=== Recovery Job Terminated (Exit Code: {code}) ===")
 
         self.cleanup_runtime_directory()
-
-    # ------------------------------------------------------------------
-    # Log Formatter
-    # ------------------------------------------------------------------
 
     def parse_and_format_log(self, line):
         if not line:
@@ -2538,32 +3067,86 @@ class PhotoRecGUI(tk.Tk):
             self.output_insert_line("[STATUS] PhotoRec engine execution resumed (SIGCONT).")
 
         elif token == "PROGRESS":
-            elapsed = payload.get("elapsed", 0)
+            pct = payload.get("percent", 0.0)
+            eta = payload.get("eta", 0)
             files = payload.get("files", 0)
-            self.current_progress_var.set(f"Elapsed Time: {elapsed}s | Raw Staged Files: {files}")
+            self.progress_var.set(pct)
+            formatted_eta = format_time(eta)
+            self.current_progress_var.set(f"Scan Progress: {pct:.1f}% | Est. Time Remaining: {formatted_eta} | Files Found: {files}")
 
         elif token == "LIVE_FILE":
             fn = payload.get("filename")
             sz = human_size(payload.get("size", 0))
-            self.output_insert_line(f"  • [STAGED RAW FILE] Carved '{fn}' ({sz}) to temporary buffer. Awaiting classification & filtering.")
+            self.output_insert_line(f"  • [FOUND] '{fn}' ({sz}) staged. Awaiting post-scan size/type filtering.")
 
         elif token == "ROUTING_START":
             raw_count = payload.get("raw_files", 0)
             dest = payload.get("destination", "")
+            self.progress_var.set(90.0)
+            self.current_progress_var.set(f"Post-Processing: Analyzing {raw_count} raw files...")
             self.output_insert_line(f"\n[POST-PROCESSING] Analyzing {raw_count} raw file(s) from buffer...")
             self.output_insert_line(f"[POST-PROCESSING] Sorting, checking headers, and applying size/dimension filters -> {dest}")
+
+        elif token == "ROUTING_PROGRESS":
+            curr = payload.get("current", 0)
+            total = payload.get("total", 0)
+            pct = payload.get("percent", 90.0)
+            fn = payload.get("filename", "")
+            self.progress_var.set(pct)
+            self.current_progress_var.set(f"Sorting & Moving: [{curr}/{total}] ({pct:.1f}%) — {fn}")
+            self.output_insert_line(f"  • [SORTING] Processing file {curr} of {total}: '{fn}'")
+
+        elif token == "DUPLICATE_REQUEST":
+            filename = payload.get("filename", "unknown")
+            source_size = human_size(payload.get("source_size", 0))
+            target_size = human_size(payload.get("target_size", 0))
+
+            choice = messagebox.askyesnocancel(
+                "Duplicate File Detected",
+                f"A file named '{filename}' already exists in the destination.\n\n"
+                f"Existing file: {target_size}\n"
+                f"Recovered file: {source_size}\n\n"
+                "Yes = overwrite existing\n"
+                "No = keep both files\n"
+                "Cancel = keep existing file",
+                parent=self,
+            )
+
+            decision = "overwrite" if choice is True else "keep_both" if choice is False else "keep_existing"
+            response_file = os.path.join(self.runtime_dir or "", "duplicate_response.json")
+            try:
+                with open(response_file, "w", encoding="utf-8") as handle:
+                    json.dump({"decision": decision}, handle)
+            except OSError as exc:
+                self.output_insert_line(f"[WARNING] Could not answer duplicate prompt: {exc}")
+
+        elif token == "DUPLICATE_RESOLVED":
+            action = payload.get("action", "")
+            filename = payload.get("filename", "")
+            labels = {
+                "kept_existing": "kept the existing destination file",
+            }
+            if action in labels:
+                self.output_insert_line(f"  • [DUPLICATE] '{filename}' {labels[action]}.")
 
         elif token == "CATEGORY_DONE":
             cat = payload.get("category")
             kept = payload.get("new_files", 0)
             disc = payload.get("discarded", 0)
-            self.output_insert_line(f"[CATEGORY COMPLETE] {cat}: Moved {kept} valid file(s) to destination ({disc} discarded by size/dimension filters).")
+            routing_disc = payload.get("routing_discarded", 0)
+            self.output_insert_line(f"[CATEGORY COMPLETE] {cat}: Moved {kept} valid file(s) to destination ({disc} discarded by size/dimension filters; {routing_disc} routing discard(s), including duplicate handling).")
 
         elif token == "JOB_REPORT":
+            self.progress_var.set(100.0)
             self.output_insert_line("\n--- Final Recovery Report ---")
             self.output_insert_line(f"Overall Status: {payload.get('overall_status', 'unknown').upper()}")
-            self.output_insert_line(f"Total Staged Files Processed: {payload.get('raw_new_files', 0)}")
-            self.output_insert_line(f"Total Scan Time: {payload.get('scan_elapsed', 0)} seconds")
+            self.output_insert_line(f"Total Raw Files Found: {payload.get('raw_new_files', 0)}")
+            self.output_insert_line(f"Total Files Restored (Passed Filters): {payload.get('total_kept', 0)}")
+            self.output_insert_line(f"Total Files Discarded (Failed Filters): {payload.get('total_discarded', 0)}")
+            self.output_insert_line(f"Duplicate Handling: {payload.get('duplicate_handling', self.duplicate_handling_var.get())}")
+            self.output_insert_line(f"Duplicates Kept Existing: {payload.get('duplicate_kept_existing', 0)} | Overwritten: {payload.get('duplicate_overwritten', 0)} | Kept Both: {payload.get('duplicate_kept_both', 0)} | Asked: {payload.get('duplicate_asked', 0)}")
+            scan_elapsed = payload.get('scan_elapsed', 0)
+            self.output_insert_line(f"Total Scan Time: {format_time(scan_elapsed)}")
             if payload.get("inventory_path"):
                 self.output_insert_line(f"Inventory Manifest Written: {payload.get('inventory_path')}")
 
@@ -2596,10 +3179,6 @@ class PhotoRecGUI(tk.Tk):
         self.cleanup_runtime_directory()
         self.destroy()
 
-
-# ============================================================
-# Main Entry Point
-# ============================================================
 
 def main():
     app = PhotoRecGUI()
